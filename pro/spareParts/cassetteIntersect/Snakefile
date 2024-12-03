@@ -1,0 +1,265 @@
+
+configfile: "globalConfig.yaml"
+
+####################################
+#check cassette contents for name matching, copy files to data directory
+
+rule initializeTrain:
+    input:
+        "cassettes/cassette_{runName}/{fileName}.vcf.Train"
+    output:
+        temp("data/{runName}/{fileName}.vcf.Train")
+    script:
+        "scripts/initialize.py"
+        #print(f"{wildcards.runName}")
+        #print(f"{output[0]}")
+
+rule initializeValid:
+    input:
+        "cassettes/cassette_{runName}/{fileName}.vcf.Validate"
+    output:
+        temp("data/{runName}/{fileName}.vcf.Validate")
+    script:
+        "scripts/initialize.py"
+        #print(f"{wildcards.runName}")
+        #print(f"{output[0]}")
+
+#############################################
+#bgzip compress the vcf files
+
+rule compressTrain:
+    input:
+        "data/{runName}/{train}.vcf.Train"
+    output:
+        temp("data/{runName}/{train}.vcf.Train.gz")
+    conda:
+        "envs/samtools.yaml"
+    shell:
+        '''
+        bgzip -c {input} > {output}
+        '''
+rule compressValid:
+    input:
+        "data/{runName}/{valid}.vcf.Validate"
+    output:
+       temp("data/{runName}/{valid}.vcf.Validate.gz")
+    conda:
+        "envs/samtools.yaml"
+    shell:
+        '''
+        bgzip -c {input} > {output}
+        '''
+#############################################
+#index the compressed vcf files
+
+rule indexTrain:
+    input:
+        "data/{runName}/{train}.vcf.Train.gz"
+    output:
+        temp("data/{runName}/{train}.vcf.Train.gz.csi")
+    conda:
+        "envs/bcftools.yaml"
+    threads: 8
+    shell:
+        '''
+        bcftools index -cf --threads {threads} {input} > {output}
+        '''
+rule indexValid:
+    input:
+        "data/{runName}/{valid}.vcf.Validate.gz"
+    output:
+        temp("data/{runName}/{valid}.vcf.Validate.gz.csi")
+    conda:
+        "envs/bcftools.yaml"
+    threads: 8
+    shell:
+        '''
+        bcftools index -cf --threads {threads} {input} > {output}
+        '''
+
+#############################################
+#intersect the vcf files
+
+def gather_intersect(wildcards):
+
+    #collect wildcards from propagation
+    rn= wildcards.runName
+
+    #collect wildcards from cassette
+    gstrT= f"cassettes/cassette_{rn}/" +"{fileName}.vcf.Train"
+    gstrV= f"cassettes/cassette_{rn}/" +"{fileName}.vcf.Validate"
+
+    wcT= glob_wildcards(gstrT)
+    wcV= glob_wildcards(gstrV)
+
+    #remove duplicate wildcards
+    fnT= list(set(wcT.fileName))
+    fnV= list(set(wcV.fileName))
+
+    #inject wildcards for output of rule index
+    files= [f"{fnT[0]}.vcf.Train.gz", f"{fnV[0]}.vcf.Validate.gz", f"{fnT[0]}.vcf.Train.gz.csi", f"{fnV[0]}.vcf.Validate.gz.csi"]
+
+    rstr= f"data/{rn}/" +"{files}"
+    return expand(rstr, files= files)
+
+rule intersect:
+    input:
+        gather_intersect
+    output:
+        temp("data/{runName}/0000.vcf"),
+        temp("data/{runName}/0001.vcf"),
+        temp("data/{runName}/0002.vcf"),
+        temp("data/{runName}/0003.vcf"),
+        temp("data/{runName}/README.txt")
+    conda:
+        "envs/bcftools.yaml"
+    threads: 24
+    shell:
+        '''
+        echo "Begin Intersect"
+        echo "First arg: {input[0]}"
+        echo "Second arg: {input[1]}"
+        bcftools isec \
+	  -c snps \
+          -O v \
+          -p "data/{wildcards.runName}/" \
+          --threads {threads} \
+          {input[0]} \
+          {input[1]}
+        '''
+
+#############################################
+#rename
+
+        #0000 First Arg exclusive
+        #0001 Second Arg exclusive
+        #0002 First Arg shared
+        #0003 Second Arg shared
+
+rule renameTrain:
+    input:
+        "data/{runName}/0002.vcf"
+    output:
+        "data/{runName}/{fileName}.vcf.Train.Intersect"
+    shell:
+        '''
+        cp {input} {output}
+        '''
+
+rule renameValid:
+    input:
+        "data/{runName}/0003.vcf"
+    output:
+        "data/{runName}/{fileName}.vcf.Validate.Intersect"
+    shell:
+        '''
+        cp {input} {output}
+        '''
+
+#############################################
+#analysis 
+#run script: summary of 4 OP files, and comparing 2 intersect files
+#script should be multi purpose for manual comparisons between runs
+
+def gather_analysis(wildcards):
+    print("Begin: gather analysis")
+    #collect wildcards from propagation
+    rn= wildcards.runName
+
+    #collect wildcards from cassette
+    gstrT= f"cassettes/cassette_{rn}/" +"{fileName}.vcf.Train"
+    gstrV= f"cassettes/cassette_{rn}/" +"{fileName}.vcf.Validate"
+
+    wcT= glob_wildcards(gstrT)
+    wcV= glob_wildcards(gstrV)
+
+    #remove duplicate wildcards
+    fnT= list(set(wcT.fileName))
+    fnV= list(set(wcV.fileName))
+
+    #inject wildcards for output of rule rename
+    files= [f"{fnT[0]}.vcf.Train.Intersect", f"{fnV[0]}.vcf.Validate.Intersect"]
+    rstr= f"data/{rn}/" +"{files}"
+    return expand(rstr, files= files)
+
+rule analysis:
+    input:
+        "data/{runName}/0000.vcf",
+        "data/{runName}/0001.vcf",
+        "data/{runName}/0002.vcf",
+        "data/{runName}/0003.vcf",
+        gather_analysis
+    output:
+        "data/{runName}/report.txt",
+        "data/{runName}/reportDifferences.txt"
+    conda:
+        "envs/bcftools.yaml"
+    script:
+        "scripts/analysis.py"
+
+#############################################
+#finalize
+#check for report
+#...create result
+#create done.finalize flag
+
+rule finalize:
+    input:
+        "data/{runName}/report.txt"
+    output: 
+        "results/{runName}/all.done.flag"
+    shell: 
+        '''
+        mv data/{wildcards.runName} results/
+        touch {output[0]}
+        '''
+
+
+#############################################
+#############################################
+#############################################
+#############################################
+#############################################
+
+def gather_all(wildcards):
+    #print("BEGIN gather_all")
+    
+    #Welcome to the advanced parallellization functions
+    #USER set to true to use keys to control which cassettes are to be run
+    useKeys = True 
+    #USER set to true to limit the number of runs to one
+    singleRun = False 
+
+
+    rn = []
+    if useKeys:
+        wc= glob_wildcards("keys/key_{rn}")
+        #remove duplicate wildcards
+        rn= list(set(wc.rn))
+    else:
+        wc= glob_wildcards("cassettes/cassette_{rn}/{junk}")
+        #remove duplicate wildcards
+        rn= list(set(wc.rn))
+
+    #test for correct n of run names
+    n= len(rn)
+    if n == 0:
+        raise Exception("There must be at least one key_<runName> file. See README.md")
+
+    if singleRun and n > 1:
+        if useKeys:
+            raise Exception("There must be only one file key_<runName> See README.md")
+        else:
+            raise Exception("There must be only one dir cassette_<runName> See README.md")
+    
+    #create return string
+    rstr = "results/{runName}/all.done.flag"
+
+    #inject wildcard for runName
+    frstr= expand(rstr, runName = rn)
+    return frstr
+
+rule all:
+    input: gather_all
+    shell: "echo BEGIN all"
+
